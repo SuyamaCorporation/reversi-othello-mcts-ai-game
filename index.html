@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>リバーシ MCTS AI対戦</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .board-cell {
+      width: 56px;
+      height: 56px;
+      background: #166534;
+      border: 1px solid #15803d;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      position: relative;
+      transition: background 0.1s;
+    }
+    .board-cell:hover { background: #14532d; }
+    .board-cell.hint::after {
+      content: '';
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.35);
+      display: block;
+    }
+    .stone {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .stone.black { background: radial-gradient(circle at 35% 35%, #555, #111); }
+    .stone.white { background: radial-gradient(circle at 35% 35%, #fff, #ccc); }
+    #board-grid { display: grid; grid-template-columns: repeat(8, 56px); border: 3px solid #052e16; }
+    .bar-black { background: #111; }
+    .bar-white { background: #e5e7eb; }
+    .thinking-dot {
+      display: inline-block;
+      animation: blink 0.8s infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:0.2} 50%{opacity:1} }
+  </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center py-6 px-2">
+  <h1 class="text-3xl font-bold mb-2 text-green-400">⚫⚪ リバーシ MCTS AI</h1>
+
+  <div class="flex gap-4 mb-4 flex-wrap justify-center items-center">
+    <div class="flex items-center gap-2 text-sm">
+      <label class="text-gray-300">あなた:</label>
+      <select id="player-color" class="bg-gray-700 text-white rounded px-2 py-1 border border-gray-600">
+        <option value="1">⚫ 黒（先手）</option>
+        <option value="-1">⚪ 白（後手）</option>
+      </select>
+    </div>
+    <div class="flex items-center gap-2 text-sm">
+      <label class="text-gray-300">難易度:</label>
+      <select id="difficulty" class="bg-gray-700 text-white rounded px-2 py-1 border border-gray-600">
+        <option value="100">Easy (100)</option>
+        <option value="500" selected>Medium (500)</option>
+        <option value="1000">Hard (1000)</option>
+      </select>
+    </div>
+    <button id="btn-new" class="bg-green-700 hover:bg-green-600 px-4 py-1 rounded text-sm font-semibold transition">新しいゲーム</button>
+  </div>
+
+  <div class="flex gap-8 mb-4 items-center text-sm">
+    <div class="text-center">
+      <div class="text-gray-300">⚫ 黒</div>
+      <div id="count-black" class="text-2xl font-bold text-white">2</div>
+    </div>
+    <div id="turn-indicator" class="text-center px-3 py-1 rounded bg-gray-700 text-sm">黒の手番</div>
+    <div class="text-center">
+      <div class="text-gray-300">⚪ 白</div>
+      <div id="count-white" class="text-2xl font-bold text-white">2</div>
+    </div>
+  </div>
+
+  <div id="board-grid" class="mb-4 shadow-2xl"></div>
+
+  <!-- Stone count bar chart -->
+  <div class="w-80 h-6 flex rounded overflow-hidden mb-4 mt-2">
+    <div id="bar-black" class="bar-black transition-all" style="width:50%"></div>
+    <div id="bar-white" class="bar-white transition-all" style="width:50%"></div>
+  </div>
+
+  <div id="status-msg" class="text-sm text-gray-300 mb-2">ゲームを開始してください</div>
+
+  <script>
+    const EMPTY=0, BLACK=1, WHITE=-1;
+    const DIRS=[[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
+    let board, currentTurn, playerColor, aiColor, simCount, gameOver, aiThinking;
+
+    function newGame() {
+      board = Array.from({length:8}, ()=>new Array(8).fill(EMPTY));
+      board[3][3]=WHITE; board[3][4]=BLACK; board[4][3]=BLACK; board[4][4]=WHITE;
+      playerColor = parseInt(document.getElementById('player-color').value);
+      aiColor = -playerColor;
+      simCount = parseInt(document.getElementById('difficulty').value);
+      currentTurn = BLACK;
+      gameOver = false;
+      aiThinking = false;
+      updateUI();
+      if (currentTurn === aiColor) scheduleAI();
+    }
+
+    function getFlips(b, r, c, color) {
+      if (b[r][c] !== EMPTY) return [];
+      const flips = [];
+      for (const [dr,dc] of DIRS) {
+        let nr=r+dr, nc=c+dc, line=[];
+        while (nr>=0&&nr<8&&nc>=0&&nc<8&&b[nr][nc]===-color) {
+          line.push([nr,nc]); nr+=dr; nc+=dc;
+        }
+        if (line.length>0&&nr>=0&&nr<8&&nc>=0&&nc<8&&b[nr][nc]===color) {
+          flips.push(...line);
+        }
+      }
+      return flips;
+    }
+
+    function getLegalMoves(b, color) {
+      const moves=[];
+      for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
+        if (getFlips(b,r,c,color).length>0) moves.push([r,c]);
+      }
+      return moves;
+    }
+
+    function applyMove(b, r, c, color) {
+      const nb = b.map(row=>[...row]);
+      nb[r][c]=color;
+      for (const [fr,fc] of getFlips(nb,r,c,color)) nb[fr][fc]=color;
+      return nb;
+    }
+
+    function countStones(b) {
+      let bl=0,wh=0;
+      for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
+        if (b[r][c]===BLACK) bl++; else if (b[r][c]===WHITE) wh++;
+      }
+      return {bl,wh};
+    }
+
+    // MCTS
+    function mctsGetMove(b, color, sims) {
+      const moves = getLegalMoves(b, color);
+      if (moves.length===0) return null;
+      if (moves.length===1) return moves[0];
+
+      const wins = new Array(moves.length).fill(0);
+      const plays = new Array(moves.length).fill(0);
+
+      for (let s=0; s<sims; s++) {
+        const mi = s % moves.length; // round-robin + random
+        const [mr,mc] = moves[mi];
+        let sim = applyMove(b, mr, mc, color);
+        let turn = -color;
+        let depth = 0;
+        while (depth < 30) {
+          const lm = getLegalMoves(sim, turn);
+          if (lm.length===0) {
+            const lm2 = getLegalMoves(sim, -turn);
+            if (lm2.length===0) break;
+            turn=-turn; continue;
+          }
+          const rm = lm[Math.floor(Math.random()*lm.length)];
+          sim = applyMove(sim, rm[0], rm[1], turn);
+          turn=-turn; depth++;
+        }
+        const {bl,wh}=countStones(sim);
+        const winner = bl>wh?BLACK:(wh>bl?WHITE:0);
+        plays[mi]++;
+        if (winner===color) wins[mi]++;
+        else if (winner===0) wins[mi]+=0.5;
+      }
+
+      // UCB1 refinement pass
+      for (let s2=0; s2<sims; s2++) {
+        const totalPlays = plays.reduce((a,b)=>a+b,0);
+        let bestUCB=-Infinity, bestIdx=0;
+        for (let i=0;i<moves.length;i++) {
+          if (plays[i]===0) { bestIdx=i; break; }
+          const ucb = wins[i]/plays[i] + Math.sqrt(2*Math.log(totalPlays)/plays[i]);
+          if (ucb>bestUCB) { bestUCB=ucb; bestIdx=i; }
+        }
+        const [mr,mc]=moves[bestIdx];
+        let sim=applyMove(b,mr,mc,color);
+        let turn=-color, depth=0;
+        while (depth<30) {
+          const lm=getLegalMoves(sim,turn);
+          if (lm.length===0) {const lm2=getLegalMoves(sim,-turn);if(lm2.length===0)break;turn=-turn;continue;}
+          const rm=lm[Math.floor(Math.random()*lm.length)];
+          sim=applyMove(sim,rm[0],rm[1],turn);
+          turn=-turn; depth++;
+        }
+        const {bl,wh}=countStones(sim);
+        const winner=bl>wh?BLACK:(wh>bl?WHITE:0);
+        plays[bestIdx]++;
+        if (winner===color) wins[bestIdx]++;
+        else if (winner===0) wins[bestIdx]+=0.5;
+      }
+
+      let bestRate=-1, bestMove=moves[0];
+      for (let i=0;i<moves.length;i++) {
+        const rate=plays[i]>0?wins[i]/plays[i]:0;
+        if (rate>bestRate) { bestRate=rate; bestMove=moves[i]; }
+      }
+      return bestMove;
+    }
+
+    function scheduleAI() {
+      if (gameOver||aiThinking) return;
+      aiThinking=true;
+      setStatus('<span class="thinking-dot">●</span><span class="thinking-dot" style="animation-delay:0.2s">●</span><span class="thinking-dot" style="animation-delay:0.4s">●</span> AI思考中…');
+      setTimeout(()=>{
+        const move=mctsGetMove(board, aiColor, simCount);
+        if (move) {
+          board=applyMove(board,move[0],move[1],aiColor);
+          currentTurn=-aiColor;
+        }
+        aiThinking=false;
+        updateUI();
+        checkTurnAndAdvance();
+      }, 50);
+    }
+
+    function checkTurnAndAdvance() {
+      if (gameOver) return;
+      const lm=getLegalMoves(board,currentTurn);
+      if (lm.length===0) {
+        const lm2=getLegalMoves(board,-currentTurn);
+        if (lm2.length===0) { endGame(); return; }
+        // Pass
+        const passing = currentTurn===BLACK?'黒':'白';
+        setStatus(`${passing} はパスします`);
+        currentTurn=-currentTurn;
+        setTimeout(()=>{
+          updateUI();
+          if (currentTurn===aiColor) scheduleAI();
+        }, 800);
+      }
+    }
+
+    function endGame() {
+      gameOver=true;
+      const {bl,wh}=countStones(board);
+      let msg;
+      if (bl>wh) msg=`🎉 黒の勝利！ (${bl}:${wh})`;
+      else if (wh>bl) msg=`🎉 白の勝利！ (${bl}:${wh})`;
+      else msg=`🤝 引き分け！ (${bl}:${wh})`;
+      setStatus(msg);
+      document.getElementById('turn-indicator').textContent='ゲーム終了';
+    }
+
+    function setStatus(html) {
+      document.getElementById('status-msg').innerHTML=html;
+    }
+
+    function updateUI() {
+      const {bl,wh}=countStones(board);
+      document.getElementById('count-black').textContent=bl;
+      document.getElementById('count-white').textContent=wh;
+      const total=bl+wh||1;
+      document.getElementById('bar-black').style.width=`${bl/total*100}%`;
+      document.getElementById('bar-white').style.width=`${wh/total*100}%`;
+
+      if (!gameOver) {
+        const colorName=currentTurn===BLACK?'黒':'白';
+        const whoText = currentTurn===playerColor?`あなた(${colorName})の手番`:`AI(${colorName})の手番`;
+        document.getElementById('turn-indicator').textContent=whoText;
+        setStatus('');
+      }
+
+      const legalMoves = getLegalMoves(board, currentTurn);
+      const grid = document.getElementById('board-grid');
+      grid.innerHTML='';
+      for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
+        const cell=document.createElement('div');
+        cell.className='board-cell';
+        const isLegal = !gameOver && currentTurn===playerColor && legalMoves.some(([lr,lc])=>lr===r&&lc===c);
+        if (board[r][c]!==EMPTY) {
+          const stone=document.createElement('div');
+          stone.className='stone '+(board[r][c]===BLACK?'black':'white');
+          cell.appendChild(stone);
+        } else if (isLegal) {
+          cell.classList.add('hint');
+        }
+        if (isLegal) {
+          cell.addEventListener('click',()=>onPlayerClick(r,c));
+        }
+        grid.appendChild(cell);
+      }
+    }
+
+    function onPlayerClick(r,c) {
+      if (gameOver||aiThinking||currentTurn!==playerColor) return;
+      const flips=getFlips(board,r,c,playerColor);
+      if (flips.length===0) return;
+      board=applyMove(board,r,c,playerColor);
+      currentTurn=-playerColor;
+      updateUI();
+      checkTurnAndAdvance();
+      if (!gameOver && currentTurn===aiColor) scheduleAI();
+    }
+
+    document.getElementById('btn-new').addEventListener('click', newGame);
+    newGame();
+  </script>
+</body>
+</html>
